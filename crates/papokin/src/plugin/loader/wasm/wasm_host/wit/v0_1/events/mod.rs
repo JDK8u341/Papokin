@@ -96,8 +96,14 @@ pub(super) const fn from_wasm_block_position(
     BlockPos::new(position.x, position.y, position.z)
 }
 
+/// WIT `String` 字段为所有权边界，单次分配不可避免；`format!` 的容量
+/// 预估只来自字面量（10 字节），长名（如铜傀儡雕像变体）会触发二次
+/// 扩容。改为精确容量拼接：分配数守恒为恰好 1 次、无重分配。
 pub(super) fn to_wasm_block_name(block: &'static Block) -> String {
-    format!("minecraft:{}", block.name)
+    let mut name = String::with_capacity(10 + block.name.len());
+    name.push_str("minecraft:");
+    name.push_str(block.name);
+    name
 }
 
 pub(super) fn from_wasm_block_name(block_name: &str) -> &'static Block {
@@ -105,8 +111,12 @@ pub(super) fn from_wasm_block_name(block_name: &str) -> &'static Block {
         .unwrap_or(&Block::AIR)
 }
 
+/// 同 [`to_wasm_block_name`]：精确容量拼接，恰好 1 次分配、无扩容。
 pub(super) fn to_wasm_entity_type(entity_type: &'static EntityType) -> String {
-    format!("minecraft:{}", entity_type.resource_name)
+    let mut name = String::with_capacity(10 + entity_type.resource_name.len());
+    name.push_str("minecraft:");
+    name.push_str(entity_type.resource_name);
+    name
 }
 
 pub(super) fn from_wasm_entity_type(entity_type: &str) -> &'static EntityType {
