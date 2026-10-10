@@ -60,7 +60,7 @@ impl BellBlockEntity {
         let center = self.position.to_centered_f64();
         let raiders = world
             .get_nearby_entities(center, HEAR_RADIUS)
-            .into_values()
+            .into_iter()
             .filter(|entity| {
                 entity
                     .get_entity()

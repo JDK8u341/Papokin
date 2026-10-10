@@ -36,7 +36,7 @@ impl FollowParentGoal {
         let nearby = world.get_nearby_entities(pos, SEARCH_RADIUS);
         let mut closest: Option<(f64, Arc<dyn EntityBase>)> = None;
 
-        for candidate in nearby.values() {
+        for candidate in &nearby {
             let c_entity = candidate.get_entity();
             if c_entity.entity_type != my_type {
                 continue;

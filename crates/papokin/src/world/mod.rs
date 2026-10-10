@@ -4153,9 +4153,8 @@ impl World {
     }
 
     /// 获取给定世界位置附近的玩家。
-    /// 它“创建”一个球体，并检查玩家是否在球体内部
-    /// 并返回一个 `HashMap`，其中 UUID 作为键，`Player`
-    /// 对象则是值。
+    /// 它“创建”一个球体，并检查玩家是否在球体内部，
+    /// 返回球内全部玩家的列表（按玩家表序）。
     ///
     /// # Arguments
     /// * `pos`: 球体的中心。
@@ -4173,13 +4172,15 @@ impl World {
             .collect()
     }
 
-    pub fn get_nearby_entities(
+    /// 就地收集范围内实体的候选迭代器（区块索引优先，大半径回退
+    /// 全表线性扫描）。两路径产出均天然去重：索引查询按
+    /// `Arc::ptr_eq` 去重（见 `entity_index`），全表每实体恰一项，
+    /// 调用方无需再去重。
+    fn nearby_entity_candidates(
         &self,
         pos: Vector3<f64>,
         radius: f64,
-    ) -> HashMap<uuid::Uuid, Arc<dyn EntityBase>> {
-        let radius_squared = radius.powi(2);
-
+    ) -> Box<dyn Iterator<Item = Arc<dyn EntityBase>>> {
         // AI 目标选择等高频调用走分块索引（代价 O(候选数)）；
         // 大半径（半径 64+，跨度超过索引阈值）回退全表线性扫描，
         // 保证任意半径仍然正确。见 `entity_index` 模块文档。
@@ -4191,8 +4192,7 @@ impl World {
             get_section_cord((pos.x + radius).floor() as i32),
             get_section_cord((pos.z + radius).floor() as i32),
         );
-        let candidates: Box<dyn Iterator<Item = Arc<dyn EntityBase>>> = self
-            .entities_by_chunk
+        self.entities_by_chunk
             .query(min_chunk, max_chunk, 64)
             .map_or_else(
                 || {
@@ -4206,27 +4206,45 @@ impl World {
                     )
                 },
                 |indexed| Box::new(indexed.into_iter()),
-            );
+            )
+    }
 
-        candidates
-            .filter_map(|entity| {
+    /// 收集位置在 `pos` 球形范围内的全部实体（产出已去重，见
+    /// [`Self::nearby_entity_candidates`]）。消费方全部为纯迭代、
+    /// 无按 UUID 查找，故直接返回 `Vec`——旧形态每次调用都要构建
+    /// 一个 `HashMap`（桶分配 + 逐条目哈希），对结果无任何影响。
+    pub fn get_nearby_entities(&self, pos: Vector3<f64>, radius: f64) -> Vec<Arc<dyn EntityBase>> {
+        let radius_squared = radius.powi(2);
+
+        self.nearby_entity_candidates(pos, radius)
+            .filter(|entity| {
                 let entity_pos = entity.get_entity().pos.load();
-                (entity_pos.squared_distance_to_vec(&pos) <= radius_squared)
-                    .then(|| (entity.get_entity().entity_uuid, entity))
+                entity_pos.squared_distance_to_vec(&pos) <= radius_squared
             })
             .collect()
     }
 
     /// 满足 `predicate` 的最近玩家。与 [`Self::get_closest_player`] 不同，更近的
     /// 未通过谓词的玩家不会遮蔽更远处通过谓词的玩家。
+    ///
+    /// 单遍扫描（距离过滤 → 谓词过滤 → 就近取小），不再先收集
+    /// 全量玩家 `Vec` 再筛选——筛选/瞄准类 AI 目标高频调用全程
+    /// 零分配。等距并列时取玩家表序更前者（旧经 HashMap/收集的
+    /// 并列胜者本就不确定，无可观察差异）。
     pub fn get_nearest_player(
         &self,
         pos: Vector3<f64>,
         radius: f64,
         predicate: impl Fn(&Arc<Player>) -> bool,
     ) -> Option<Arc<Player>> {
-        self.get_nearby_players(pos, radius)
-            .into_iter()
+        let radius_squared = radius.powi(2);
+        self.players
+            .load()
+            .iter()
+            .filter(|player| {
+                let player_pos = player.get_entity().pos.load();
+                player_pos.squared_distance_to_vec(&pos) <= radius_squared
+            })
             .filter(|player| predicate(player))
             .min_by(|a, b| {
                 a.get_entity()
@@ -4235,10 +4253,15 @@ impl World {
                     .squared_distance_to_vec(&pos)
                     .total_cmp(&b.get_entity().pos.load().squared_distance_to_vec(&pos))
             })
+            .cloned()
     }
 
     /// 满足 `predicate` 的最近实体。为何如此，参见 [`Self::get_nearest_player`]
     /// 并非 [`Self::get_closest_entity`] 再加一次检查。
+    ///
+    /// 单遍扫描候选迭代器（距离过滤 → 类型/谓词过滤 → 就近取小），
+    /// 不再先收集全量 `HashMap` 再筛选——AI 目标选择高频调用全程
+    /// 除索引查询自身外零分配。
     pub fn get_nearest_entity(
         &self,
         pos: Vector3<f64>,
@@ -4246,8 +4269,12 @@ impl World {
         entity_types: Option<&[&'static EntityType]>,
         predicate: impl Fn(&Arc<dyn EntityBase>) -> bool,
     ) -> Option<Arc<dyn EntityBase>> {
-        self.get_nearby_entities(pos, radius)
-            .into_values()
+        let radius_squared = radius.powi(2);
+        self.nearby_entity_candidates(pos, radius)
+            .filter(|entity| {
+                let entity_pos = entity.get_entity().pos.load();
+                entity_pos.squared_distance_to_vec(&pos) <= radius_squared
+            })
             .filter(|entity| {
                 entity_types.is_none_or(|types| types.contains(&entity.get_entity().entity_type))
                     && predicate(entity)

@@ -135,7 +135,7 @@ impl Mob for ZombifiedPiglinEntity {
                 let world = entity.world.load();
                 let my_pos = entity.pos.load();
                 let nearby_zombies = world.get_nearby_entities(my_pos, 35.0);
-                for (_uuid, other) in nearby_zombies {
+                for other in nearby_zombies {
                     if other.get_entity().entity_id != entity.entity_id
                         && other.get_entity().entity_type == &EntityType::ZOMBIFIED_PIGLIN
                         && let Some(mob) = other.get_mob()

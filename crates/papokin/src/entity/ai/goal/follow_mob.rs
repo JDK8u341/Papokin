@@ -35,7 +35,7 @@ impl Goal for FollowMobGoal {
         let world = mob.get_entity().world.load();
 
         let nearby = world.get_nearby_entities(pos, self.area_size);
-        for candidate in nearby.values() {
+        for candidate in &nearby {
             let c_entity = candidate.get_entity();
             if c_entity.entity_uuid == my_uuid {
                 continue;
