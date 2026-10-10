@@ -76,6 +76,6 @@
 
 ## 负面发现与后续清单
 
-- 共享 wasmtime `Engine` + 内存保留参数调优（每插件一 Engine/一 100ms ticker、~4GiB VA 预留/实例未调）：本轮侦察确认现状，属架构级改造，留待后续轮次；
+- 共享 wasmtime `Engine` + 内存保留参数调优（每插件一 Engine/一 100ms ticker、~4GiB VA 预留/实例未调）：本轮侦察确认现状，属架构级改造，留待后续轮次（批注：Engine/Linker/缓存线程/ticker 共享化已由轮次 28 收编；~4GiB VA 属 per-Store 线性内存面，轮次 28 论证后明确不调）；
 - 事件派发路径的每调用 `format!("minecraft:...")` String 与逐资源 boxed 闭包：分配率优化点，未动（批注：轮次 27 已收编，见 round-27 报告）；
 - WASM `Store`/`Instance` 生命周期与 IPC 缓冲经侦察确认全部有界（`StoreLimits` 512MB 上限、`RESOURCE_TABLE` 8192 硬顶、无 thread_local 残留），如实记录防重复探查。
