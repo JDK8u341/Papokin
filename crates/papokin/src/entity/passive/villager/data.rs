@@ -126,6 +126,15 @@ pub struct VillagerData {
     pub level: VarInt,
 }
 
+impl crate::entity::synched_entity_data::IntoTrackedValue for VillagerData {
+    fn into_tracked_value(
+        self,
+        tracked: papokin_data::tracked_data::TrackedData,
+    ) -> crate::entity::synched_entity_data::TrackedValue {
+        crate::entity::synched_entity_data::boxed_value(self, tracked)
+    }
+}
+
 impl papokin_protocol::java::client::play::MetadataSerializer for VillagerData {
     fn write_metadata(
         &self,

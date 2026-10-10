@@ -78,6 +78,15 @@ struct ParticleMeta {
     data: Box<[u8]>,
 }
 
+impl crate::entity::synched_entity_data::IntoTrackedValue for ParticleMeta {
+    fn into_tracked_value(
+        self,
+        tracked: papokin_data::tracked_data::TrackedData,
+    ) -> crate::entity::synched_entity_data::TrackedValue {
+        crate::entity::synched_entity_data::boxed_value(self, tracked)
+    }
+}
+
 impl papokin_protocol::java::client::play::MetadataSerializer for ParticleMeta {
     fn write_metadata(
         &self,

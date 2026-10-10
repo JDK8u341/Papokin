@@ -154,6 +154,15 @@ struct EffectParticle {
 #[derive(Clone)]
 struct EffectParticles(Vec<EffectParticle>);
 
+impl crate::entity::synched_entity_data::IntoTrackedValue for EffectParticles {
+    fn into_tracked_value(
+        self,
+        tracked: papokin_data::tracked_data::TrackedData,
+    ) -> crate::entity::synched_entity_data::TrackedValue {
+        crate::entity::synched_entity_data::boxed_value(self, tracked)
+    }
+}
+
 impl MetadataSerializer for EffectParticles {
     fn write_metadata(
         &self,

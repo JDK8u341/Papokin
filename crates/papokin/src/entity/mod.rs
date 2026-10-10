@@ -3002,7 +3002,9 @@ impl Entity {
             .play_sound(sound, SoundCategory::Neutral, &self.pos.load());
     }
 
-    pub fn set_synced_data<T: MetadataSerializer + Clone + Send + Sync + 'static>(
+    pub fn set_synced_data<
+        T: MetadataSerializer + Clone + Send + Sync + 'static + synched_entity_data::IntoTrackedValue,
+    >(
         &self,
         tracked: papokin_data::tracked_data::TrackedData,
         value: T,
