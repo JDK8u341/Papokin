@@ -105,13 +105,8 @@ impl PluginLoader for WasmPluginLoader {
             let spawner = Arc::new(TokioSpawner::new(tokio::runtime::Handle::current()));
             let mut runtime = PluginRuntime::new(&path, self.legacy_sync_reentry.clone(), spawner)?;
             let (plugin, metadata) = runtime.init_plugin(&path, self.verify_signatures).await?;
-            // epoch ticker 必须随插件存活：PluginRuntime 在 load 返回后
-            // 即被 drop，ticker 若随之停止，epoch 不再递增，
-            // `set_epoch_budget` 的调用超时便永不触发。
-            *plugin
-                .epoch_ticker
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = runtime.take_epoch_ticker();
+            // epoch ticker 守卫已由 init_plugin 转交给插件持有：共享
+            // 定时任务按存活插件数引用计数，最后一个插件卸载时才中止。
 
             Ok((
                 plugin as Arc<dyn Plugin>,

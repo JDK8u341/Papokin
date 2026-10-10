@@ -1,6 +1,11 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use std::{fs, net::SocketAddr, path::Path, sync::Arc};
+use std::{
+    fs,
+    net::SocketAddr,
+    path::Path,
+    sync::{Arc, OnceLock},
+};
 use thiserror::Error;
 use wasmtime::{Cache, CacheConfig, Engine, component::Component, component::Linker};
 use wasmtime_wasi::{FsPerms, WasiCtxBuilder, sockets::SocketAddrUse};
@@ -109,31 +114,170 @@ fn socket_policy_for_permissions(
     }
 }
 
-pub struct PluginRuntime {
+/// 进程级共享的 Wasmtime 底座：Engine、全量宿主 API 的 Linker 与
+/// epoch 定时任务各只建一份，所有插件共用。
+///
+/// 旧形态每插件各建一套：一个 Engine（内部类型注册表与分配基础设
+/// 施）、一个缓存工作线程（`Cache::new` 无条件 `thread::spawn`）、
+/// 一份全量宿主 API 的 Linker 注册、一个 100ms epoch ticker 定时任
+/// 务。所有插件的 Config 输入完全相同（同一批常量；缓存目录为插件
+/// 目录下共享的 `cache/`——插件发现不递归子目录），共享后语义不
+/// 变：`set_epoch_deadline`/`set_epoch_budget` 均是相对共享 epoch
+/// 计数器的增量，计时速率仍为每 100ms 一拍。
+struct SharedWasmRuntime {
     engine: Engine,
-    cache_dir: std::path::PathBuf,
     linker: wasmtime::component::Linker<PluginHostState>,
-    legacy_sync_reentry: concurrent_store::LegacySyncReentry,
-    store_spawner: Arc<dyn RuntimeSpawner>,
-    /// 周期性递增引擎 epoch 的后台任务；Drop 时中止，避免
-    /// 热重载反复创建 `PluginRuntime` 时累积泄漏 ticker。
-    epoch_ticker: Option<tokio::task::AbortHandle>,
+    ticker: TickerRegistry,
 }
 
-impl Drop for PluginRuntime {
-    fn drop(&mut self) {
-        if let Some(ticker) = self.epoch_ticker.take() {
-            ticker.abort();
+static SHARED_WASM_RUNTIME: OnceLock<Arc<SharedWasmRuntime>> = OnceLock::new();
+
+/// 取进程级共享底座（首个插件加载时构建；构建失败不入缓存，下次
+/// 加载重试）。并发首载竞争时败者丢弃自建实例、采用胜者。
+fn shared_wasm_runtime(cache_dir: &Path) -> Result<Arc<SharedWasmRuntime>, PluginInitError> {
+    if let Some(shared) = SHARED_WASM_RUNTIME.get() {
+        return Ok(Arc::clone(shared));
+    }
+    let built = Arc::new(build_shared_wasm_runtime(cache_dir)?);
+    let _ = SHARED_WASM_RUNTIME.set(Arc::clone(&built));
+    Ok(Arc::clone(SHARED_WASM_RUNTIME.get().unwrap_or(&built)))
+}
+
+fn build_shared_wasm_runtime(cache_dir: &Path) -> Result<SharedWasmRuntime, PluginInitError> {
+    let mut config = wasmtime::Config::new();
+    config.wasm_component_model(true);
+    config.wasm_component_model_async(true);
+    config.concurrency_support(true);
+    // 启用基于 epoch 的 guest 中断：配合 StoreExecutor 的 epoch 预算
+    // 与共享定时任务，死循环插件会被 trap 中断，而不是永久占住
+    // 同步事件派发线程。
+    config.epoch_interruption(true);
+    let mut cache_config = CacheConfig::new();
+    cache_config.with_directory(cache_dir);
+    let cache = Cache::new(cache_config).map_err(PluginInitError::CacheCreationFailed)?;
+    config.cache(Some(cache));
+
+    config.gc_support(true);
+    config.wasm_gc(true);
+    config.wasm_exceptions(true);
+    config.wasm_function_references(true);
+
+    let engine = Engine::new(&config).map_err(PluginInitError::EngineCreationFailed)?;
+    let linker = setup_linker(&engine).map_err(PluginInitError::LinkerSetupFailed)?;
+    let ticker = TickerRegistry::new(engine.clone());
+    Ok(SharedWasmRuntime {
+        engine,
+        linker,
+        ticker,
+    })
+}
+
+/// 共享 epoch 定时任务的注册表：单个 100ms 定时任务服务全部插件，
+/// 按存活守卫数引用计数——首个守卫获取时启动，最后一个释放时中止
+/// （之后再加载会重新启动）。计数与启停全部在同一把互斥锁内完成，
+/// 无竞态窗口。
+#[derive(Clone)]
+struct TickerRegistry {
+    inner: Arc<TickerInner>,
+}
+
+struct TickerInner {
+    engine: Engine,
+    state: std::sync::Mutex<TickerState>,
+}
+
+struct TickerState {
+    /// 存活守卫数；为 0 时定时任务不应存在。
+    live: usize,
+    /// 当前定时任务；`None` = 未运行。
+    task: Option<tokio::task::AbortHandle>,
+}
+
+impl TickerRegistry {
+    fn new(engine: Engine) -> Self {
+        Self {
+            inner: Arc::new(TickerInner {
+                engine,
+                state: std::sync::Mutex::new(TickerState {
+                    live: 0,
+                    task: None,
+                }),
+            }),
+        }
+    }
+
+    /// 获取守卫。仅在已存在 tokio 运行时时启动定时任务（加载器
+    /// 运行于异步上下文，与旧形态约束一致；无运行时则超时预算
+    /// 不生效，行为同旧形态）。
+    fn acquire(&self) -> TickerGuard {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.live += 1;
+        if state.task.is_none()
+            && let Ok(handle) = tokio::runtime::Handle::try_current()
+        {
+            let ticker_engine = self.inner.engine.clone();
+            state.task = Some(
+                handle
+                    .spawn(async move {
+                        let mut interval = tokio::time::interval(std::time::Duration::from_millis(
+                            EPOCH_TICKER_INTERVAL_MS,
+                        ));
+                        loop {
+                            interval.tick().await;
+                            ticker_engine.increment_epoch();
+                        }
+                    })
+                    .abort_handle(),
+            );
+        }
+        TickerGuard {
+            inner: Arc::clone(&self.inner),
         }
     }
 }
 
+/// 共享 epoch ticker 的引用计数守卫：随 [`WasmPlugin`] 存活，
+/// Drop 时递减计数，最后一个守卫释放时中止共享定时任务。
+struct TickerGuard {
+    inner: Arc<TickerInner>,
+}
+
+impl Drop for TickerGuard {
+    fn drop(&mut self) {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.live = state.live.saturating_sub(1);
+        if state.live == 0
+            && let Some(task) = state.task.take()
+        {
+            task.abort();
+        }
+    }
+}
+
+pub struct PluginRuntime {
+    /// 进程级共享底座（Engine/Linker/缓存与 epoch 定时任务各一份）。
+    shared: Arc<SharedWasmRuntime>,
+    cache_dir: std::path::PathBuf,
+    legacy_sync_reentry: concurrent_store::LegacySyncReentry,
+    store_spawner: Arc<dyn RuntimeSpawner>,
+    /// 共享 epoch ticker 的守卫；加载成功后由
+    /// [`Self::init_plugin`] 转交给 [`WasmPlugin`] 持有，加载失败
+    /// 随本结构 Drop 释放（最后一个释放者中止定时任务）。
+    epoch_ticker: Option<TickerGuard>,
+}
+
 impl PluginRuntime {
-    /// 取走 epoch ticker 的所有权（返回后 Drop 不再中止它）。
-    ///
-    /// 加载成功后由调用方转交给 [`WasmPlugin`] 持有：ticker
-    /// 必须活到插件销毁，否则调用超时预算失效。
-    pub const fn take_epoch_ticker(&mut self) -> Option<tokio::task::AbortHandle> {
+    /// 取走 epoch ticker 守卫的所有权（返回后本结构 Drop 不再释放
+    /// 该计数）。
+    const fn take_epoch_ticker(&mut self) -> Option<TickerGuard> {
         self.epoch_ticker.take()
     }
 }
@@ -150,13 +294,13 @@ pub struct WasmPlugin {
     /// 世界生成器等按插件归属回收的资源以此匹配：卸载/禁用
     /// 时只恢复仍由该插件持有的资源，不误伤其他插件。
     pub name: String,
-    /// 周期性递增引擎 epoch 的后台任务句柄。
+    /// 共享 epoch ticker 的引用计数守卫。
     ///
-    /// ticker 由加载时的 [`PluginRuntime`] 创建，但必须随插件
-    /// 存活：`PluginRuntime` 在 load 返回后即被 drop，ticker 若
-    /// 随之停止，epoch 不再递增，`set_epoch_budget` 的调用超时
-    /// 便永不触发。插件 drop 时在此中止。
-    pub epoch_ticker: std::sync::Mutex<Option<tokio::task::AbortHandle>>,
+    /// 定时任务由首个插件加载时创建、全进程共享（每 100ms 递增
+    /// 一次共享 Engine 的 epoch）；守卫随插件存活，最后一个插件
+    /// 卸载时定时任务才中止——期间 `set_epoch_budget` 的调用超时
+    /// 始终有效。
+    epoch_ticker: TickerGuard,
 }
 
 /// 未配置 `max_memory_mb` 时对插件施加的默认内存上限。
@@ -170,14 +314,8 @@ const EPOCH_TICKER_INTERVAL_MS: u64 = 100;
 
 impl Drop for WasmPlugin {
     fn drop(&mut self) {
-        if let Some(ticker) = self
-            .epoch_ticker
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
-        {
-            ticker.abort();
-        }
+        // epoch_ticker 守卫随字段 Drop 释放计数（最后一个插件卸载时
+        // 才中止共享定时任务）；store 需先显式弃置驱动任务。
         self.store.discard();
     }
 }
@@ -192,53 +330,20 @@ impl PluginRuntime {
         legacy_sync_reentry: concurrent_store::LegacySyncReentry,
         store_spawner: Arc<dyn RuntimeSpawner>,
     ) -> Result<Self, PluginInitError> {
-        let mut config = wasmtime::Config::new();
-        config.wasm_component_model(true);
-        config.wasm_component_model_async(true);
-        config.concurrency_support(true);
-        // 启用基于 epoch 的 guest 中断：配合 StoreExecutor 的
-        // epoch 预算与下方定时器，死循环插件会被 trap 中断，
-        // 而不是永久占住同步事件派发线程。
-        config.epoch_interruption(true);
         let mut path =
             std::path::absolute(path.as_ref()).map_err(PluginInitError::PathResolutionFailed)?;
         path.pop();
         path.push("cache");
-        let mut cache_config = CacheConfig::new();
-        cache_config.with_directory(&path);
-        let cache = Cache::new(cache_config).map_err(PluginInitError::CacheCreationFailed)?;
-        config.cache(Some(cache));
 
-        config.gc_support(true);
-        config.wasm_gc(true);
-        config.wasm_exceptions(true);
-        config.wasm_function_references(true);
-
-        let engine = Engine::new(&config).map_err(PluginInitError::EngineCreationFailed)?;
-
-        let linker = setup_linker(&engine).map_err(PluginInitError::LinkerSetupFailed)?;
-
-        // 定时递增 epoch 驱动 guest 调用的截止判定；仅在已存在
-        // tokio 运行时时启动（加载器运行于异步上下文）。
-        let epoch_ticker = tokio::runtime::Handle::try_current().ok().map(|handle| {
-            let ticker_engine = engine.clone();
-            handle
-                .spawn(async move {
-                    let mut interval = tokio::time::interval(std::time::Duration::from_millis(
-                        EPOCH_TICKER_INTERVAL_MS,
-                    ));
-                    loop {
-                        interval.tick().await;
-                        ticker_engine.increment_epoch();
-                    }
-                })
-                .abort_handle()
-        });
+        // 进程级共享底座：Engine/Linker/缓存与 epoch 定时任务只在
+        // 首次加载时构建（全部插件的 Config 输入相同）。
+        let shared = shared_wasm_runtime(&path)?;
+        // 共享 ticker 守卫：加载成功后转交给 WasmPlugin 持有。
+        let epoch_ticker = Some(shared.ticker.acquire());
 
         Ok(Self {
-            engine,
+            shared,
             cache_dir: path,
-            linker,
             legacy_sync_reentry,
             store_spawner,
             epoch_ticker,
@@ -246,7 +351,7 @@ impl PluginRuntime {
     }
 
     pub async fn init_plugin<P: AsRef<Path>>(
-        &self,
+        &mut self,
         path: P,
         verify_signatures: bool,
     ) -> Result<(Arc<WasmPlugin>, PluginMetadata), PluginInitError> {
@@ -284,7 +389,7 @@ impl PluginRuntime {
         // JIT 编译（及缓存反序列化）受 CPU 限制，可能耗时
         // 分钟（对大型调试构建而言）；不要把它放到异步工作线程上
         // 这样热重载就无法拖住服务器运行时。
-        let engine = self.engine.clone();
+        let engine = self.shared.engine.clone();
         let cache_dir = self.cache_dir.clone();
         let component =
             tokio::task::spawn_blocking(move || load_component(&engine, &wasm_bytes, &cache_dir))
@@ -296,6 +401,7 @@ impl PluginRuntime {
                 })??;
 
         let instance_pre = self
+            .shared
             .linker
             .instantiate_pre(&component)
             .map_err(PluginInitError::ApiVersionMismatch)?;
@@ -305,7 +411,7 @@ impl PluginRuntime {
                 .map_err(PluginInitError::ApiVersionMismatch)?;
 
             wit::v0_1::init_plugin(
-                &self.engine,
+                &self.shared.engine,
                 plugin_pre,
                 &self.legacy_sync_reentry,
                 Self::DEFAULT_CALL_TIMEOUT_SECONDS * 1000 / EPOCH_TICKER_INTERVAL_MS,
@@ -323,11 +429,16 @@ impl PluginRuntime {
         // 默认先施加保守预算；on_load 读取配置后会覆盖为用户值。
         store
             .set_epoch_budget(Self::DEFAULT_CALL_TIMEOUT_SECONDS * 1000 / EPOCH_TICKER_INTERVAL_MS);
+        // ticker 守卫转交插件持有：加载成功后本结构即被 Drop，
+        // 守卫须随插件存活（最后一个插件卸载才停共享定时任务）。
+        let epoch_ticker = self
+            .take_epoch_ticker()
+            .expect("PluginRuntime 构建即持有 ticker 守卫");
         let wasm_plugin = Arc::new(WasmPlugin {
             plugin_instance: Arc::new(plugin_instance),
             store,
             name: metadata.name.clone(),
-            epoch_ticker: std::sync::Mutex::new(None),
+            epoch_ticker,
         });
         let weak_plugin = Arc::downgrade(&wasm_plugin);
         wasm_plugin
@@ -731,9 +842,13 @@ pub trait DowncastResourceExt<E> {
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
+    use wasmtime::Engine;
     use wasmtime_wasi::sockets::SocketAddrUse;
 
-    use super::{SocketPolicy, permissions, socket_policy_for_permissions};
+    use super::{
+        PluginRuntime, SHARED_WASM_RUNTIME, SocketPolicy, TickerRegistry,
+        concurrent_store::LegacySyncReentry, permissions, socket_policy_for_permissions,
+    };
 
     const PORT: u16 = 25_565;
 
@@ -868,5 +983,101 @@ mod tests {
         ] {
             assert!(!policy.allows(address, reason));
         }
+    }
+
+    /// 共享 ticker 的引用计数语义：首个守卫启动定时任务、存活期间
+    /// 复用、最后一个释放中止、之后可重新启动。
+    #[tokio::test]
+    async fn ticker_refcount_starts_stops_and_respawns_shared_task() {
+        let registry = TickerRegistry::new(Engine::default());
+        let snapshot = |registry: &TickerRegistry| {
+            let state = registry
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (state.live, state.task.is_some())
+        };
+
+        let guard_one = registry.acquire();
+        assert_eq!(snapshot(&registry), (1, true), "首个守卫应启动共享定时任务");
+        let guard_two = registry.acquire();
+        assert_eq!(snapshot(&registry), (2, true), "第二个守卫复用同一任务");
+
+        drop(guard_two);
+        assert_eq!(snapshot(&registry), (1, true), "仍有存活守卫时任务继续");
+        drop(guard_one);
+        assert_eq!(
+            snapshot(&registry),
+            (0, false),
+            "最后一个守卫释放应中止任务"
+        );
+
+        let guard_three = registry.acquire();
+        assert_eq!(snapshot(&registry), (1, true), "再次获取应重启定时任务");
+        drop(guard_three);
+        assert_eq!(snapshot(&registry), (0, false), "守卫全释后任务再次中止");
+    }
+
+    /// 两次构建 `PluginRuntime` 必须共享同一进程级底座（Engine/
+    /// Linker/缓存各一份），且 ticker 计数随两份守卫全部释放归零。
+    #[tokio::test]
+    async fn plugin_runtime_shares_process_wide_base() {
+        let probe_dir =
+            std::env::temp_dir().join(format!("papokin-r28-shared-{}", std::process::id()));
+        std::fs::create_dir_all(&probe_dir).expect("创建临时探测目录");
+        let probe_wasm = probe_dir.join("probe.wasm"); // 只参与路径推导，不读文件
+
+        let spawner: std::sync::Arc<dyn papokin_plugin_runtime::RuntimeSpawner> =
+            std::sync::Arc::new(super::concurrent_store::TokioSpawner::new(
+                tokio::runtime::Handle::current(),
+            ));
+
+        let mut runtime_one = PluginRuntime::new(&probe_wasm, LegacySyncReentry::new(), spawner)
+            .expect("首次构建共享底座");
+        let runtime_two = {
+            let spawner: std::sync::Arc<dyn papokin_plugin_runtime::RuntimeSpawner> =
+                std::sync::Arc::new(super::concurrent_store::TokioSpawner::new(
+                    tokio::runtime::Handle::current(),
+                ));
+            PluginRuntime::new(&probe_wasm, LegacySyncReentry::new(), spawner)
+                .expect("第二次构建应复用底座")
+        };
+
+        assert!(
+            std::sync::Arc::ptr_eq(&runtime_one.shared, &runtime_two.shared),
+            "两次构建必须共享同一份底座"
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(
+                &runtime_one.shared,
+                SHARED_WASM_RUNTIME.get().expect("底座已初始化")
+            ),
+            "进程级单例必须与运行时持有的底座一致"
+        );
+
+        let ticker_state = |runtime: &PluginRuntime| {
+            let state = runtime
+                .shared
+                .ticker
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (state.live, state.task.is_some())
+        };
+        assert_eq!(ticker_state(&runtime_two), (2, true), "两份守卫都在计数");
+
+        drop(runtime_one);
+        drop(runtime_two);
+        let shared = SHARED_WASM_RUNTIME.get().expect("底座已初始化");
+        let state = shared
+            .ticker
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!((state.live, state.task.is_some()), (0, false));
+        let _ = std::fs::remove_dir_all(&probe_dir);
     }
 }
