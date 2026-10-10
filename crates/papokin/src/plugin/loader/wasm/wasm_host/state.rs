@@ -231,8 +231,47 @@ pub struct PluginHostState {
     dispatch_guard_depth: u32,
 }
 
-/// 按记录 rep 从资源表删除单条条目的回收闭包。
-pub type ResourceTableDeleter = Box<dyn FnOnce(&mut ResourceTable) + Send>;
+/// 派发护栏条目：按记录 rep 从资源表删除单条条目的静态描述。
+///
+/// 旧形态为 `Box<dyn FnOnce(&mut ResourceTable) + Send>` 回收闭包——
+/// 每个受护栏资源在每次事件派发都产生一次堆分配（Server/Player/World
+/// 三资源的高频事件即每派发 3 次）。枚举化后为纯数据（rep + 目标类型
+/// 标签），护栏记录与失败重放全程零分配；删除语义与各 `add_*` 现场
+/// 的闭包逐一等价（同类型、同 rep 的 `table.delete`）。
+pub enum ResourceTableDeleter {
+    Server(u32),
+    Player(u32),
+    World(u32),
+    TextComponent(u32),
+    ItemStack(u32),
+}
+
+impl ResourceTableDeleter {
+    /// 失败重放：从资源表删除本条目记录的资源。对已按正常路径
+    /// 释放过的 rep 删除为无害 no-op；访客 trap 后残留的句柄即使
+    /// 被其后续使用也只得到干净的「无效句柄」错误。
+    fn replay(self, table: &mut ResourceTable) {
+        match self {
+            Self::Server(rep) => {
+                let _ = table.delete::<ServerResource>(wasmtime::component::Resource::new_own(rep));
+            }
+            Self::Player(rep) => {
+                let _ = table.delete::<PlayerResource>(wasmtime::component::Resource::new_own(rep));
+            }
+            Self::World(rep) => {
+                let _ = table.delete::<WorldResource>(wasmtime::component::Resource::new_own(rep));
+            }
+            Self::TextComponent(rep) => {
+                let _ = table
+                    .delete::<TextComponentResource>(wasmtime::component::Resource::new_own(rep));
+            }
+            Self::ItemStack(rep) => {
+                let _ =
+                    table.delete::<ItemStackResource>(wasmtime::component::Resource::new_own(rep));
+            }
+        }
+    }
+}
 
 impl Default for PluginHostState {
     fn default() -> Self {
@@ -304,16 +343,13 @@ impl PluginHostState {
     pub fn end_dispatch_guard_failure(&mut self) {
         self.dispatch_guard_depth = self.dispatch_guard_depth.saturating_sub(1);
         for deleter in std::mem::take(&mut self.dispatch_guard) {
-            deleter(&mut self.resource_table);
+            deleter.replay(&mut self.resource_table);
         }
     }
 
-    fn record_dispatch_guard<F>(&mut self, delete: F)
-    where
-        F: FnOnce(&mut ResourceTable) + Send + 'static,
-    {
+    fn record_dispatch_guard(&mut self, deleter: ResourceTableDeleter) {
         if self.dispatch_guard_depth > 0 {
-            self.dispatch_guard.push(Box::new(delete));
+            self.dispatch_guard.push(deleter);
         }
     }
 
@@ -323,9 +359,7 @@ impl PluginHostState {
     ) -> wasmtime::Result<wasmtime::component::Resource<T>> {
         let resource = self.resource_table.push(ServerResource { provider })?;
         let rep = resource.rep();
-        self.record_dispatch_guard(move |table| {
-            let _ = table.delete::<ServerResource>(wasmtime::component::Resource::new_own(rep));
-        });
+        self.record_dispatch_guard(ResourceTableDeleter::Server(rep));
         Ok(wasmtime::component::Resource::new_own(rep))
     }
 
@@ -343,9 +377,7 @@ impl PluginHostState {
     ) -> wasmtime::Result<wasmtime::component::Resource<T>> {
         let resource = self.resource_table.push(PlayerResource { provider })?;
         let rep = resource.rep();
-        self.record_dispatch_guard(move |table| {
-            let _ = table.delete::<PlayerResource>(wasmtime::component::Resource::new_own(rep));
-        });
+        self.record_dispatch_guard(ResourceTableDeleter::Player(rep));
         Ok(wasmtime::component::Resource::new_own(rep))
     }
 
@@ -389,9 +421,7 @@ impl PluginHostState {
     ) -> wasmtime::Result<wasmtime::component::Resource<T>> {
         let resource = self.resource_table.push(WorldResource { provider })?;
         let rep = resource.rep();
-        self.record_dispatch_guard(move |table| {
-            let _ = table.delete::<WorldResource>(wasmtime::component::Resource::new_own(rep));
-        });
+        self.record_dispatch_guard(ResourceTableDeleter::World(rep));
         Ok(wasmtime::component::Resource::new_own(rep))
     }
 
@@ -467,10 +497,7 @@ impl PluginHostState {
             .resource_table
             .push(TextComponentResource { provider })?;
         let rep = resource.rep();
-        self.record_dispatch_guard(move |table| {
-            let _ =
-                table.delete::<TextComponentResource>(wasmtime::component::Resource::new_own(rep));
-        });
+        self.record_dispatch_guard(ResourceTableDeleter::TextComponent(rep));
         Ok(wasmtime::component::Resource::new_own(rep))
     }
 
@@ -526,9 +553,7 @@ impl PluginHostState {
     ) -> wasmtime::Result<wasmtime::component::Resource<T>> {
         let resource = self.resource_table.push(ItemStackResource { provider })?;
         let rep = resource.rep();
-        self.record_dispatch_guard(move |table| {
-            let _ = table.delete::<ItemStackResource>(wasmtime::component::Resource::new_own(rep));
-        });
+        self.record_dispatch_guard(ResourceTableDeleter::ItemStack(rep));
         Ok(wasmtime::component::Resource::new_own(rep))
     }
 
@@ -943,6 +968,34 @@ mod tests {
         assert_eq!(state.dispatch_guard_depth, 0);
     }
 
+    /// 枚举护栏条目的重放语义与旧闭包形态逐一等价：同类型、同 rep
+    /// 的 `table.delete`——命中即删，未命中（已正常释放或虚构 rep）
+    /// 为无害 no-op，绝不波及其他条目。
+    #[test]
+    fn dispatch_guard_enum_replay_matches_closure_semantics() {
+        let mut table = ResourceTable::new();
+        let kept = table
+            .push(TextComponentResource {
+                provider: TextComponent::text("常驻"),
+            })
+            .expect("压入常驻条目");
+        let doomed = table
+            .push(TextComponentResource {
+                provider: TextComponent::text("待回收"),
+            })
+            .expect("压入待回收条目");
+
+        // 命中：按记录 rep 删除，目标条目消失、其余条目不受影响
+        ResourceTableDeleter::TextComponent(doomed.rep()).replay(&mut table);
+        assert!(table.get::<TextComponentResource>(&doomed).is_err());
+        assert!(table.get::<TextComponentResource>(&kept).is_ok());
+
+        // 未命中：重复重放已删 rep 与虚构 rep 均为无害 no-op
+        ResourceTableDeleter::TextComponent(doomed.rep()).replay(&mut table);
+        ResourceTableDeleter::TextComponent(u32::MAX).replay(&mut table);
+        assert!(table.get::<TextComponentResource>(&kept).is_ok());
+    }
+
     /// 硬上限封顶：达到 `RESOURCE_TABLE_MAX_CAPACITY` 后 push 失败，
     /// 恶意访客无法无限囤积句柄（内存封顶）。
     #[test]
@@ -990,8 +1043,8 @@ mod tests {
     #[test]
     fn dispatch_guard_decay_reclaims_spike_capacity_next_round() {
         let mut guard: Vec<ResourceTableDeleter> = Vec::new();
-        for _ in 0..1000 {
-            guard.push(Box::new(|_| {}));
+        for i in 0..1000 {
+            guard.push(ResourceTableDeleter::TextComponent(i));
         }
         papokin_util::capacity::decay_clear_vec(&mut guard);
         assert!(
@@ -999,7 +1052,7 @@ mod tests {
             "尖峰轮容量 {} 应在滞回带内不收缩",
             guard.capacity()
         );
-        guard.push(Box::new(|_| {}));
+        guard.push(ResourceTableDeleter::ItemStack(1000));
         papokin_util::capacity::decay_clear_vec(&mut guard);
         assert!(
             guard.capacity() <= 128,
