@@ -495,7 +495,7 @@ mod tests {
         assert!(data.set(tracked_data::entity::DATA_CUSTOM_NAME, Some(other)));
     }
 
-    /// define 对既有键整体重置（清脏并回到默认态），与旧 HashMap
+    /// define 对既有键整体重置（清脏并回到默认态），与旧 `HashMap`
     /// 整项替换语义一致。
     #[test]
     fn define_resets_existing_entry() {
