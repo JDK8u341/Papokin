@@ -4,7 +4,7 @@
 
 每个 bin 是一个**双臂对照基准**：同一负载分别跑「优化前形态」与「优化后形态」两臂，以分配计数器（次数/净驻留字节）、耗时、canonical 输出指纹（语义等价硬闸门）量化收益；闸门预登记，未达如实记 FAIL。轮次索引与全部结果见 `note/README.md` 性能优化对照表与各 `round-*.md` 报告。
 
-## 基准清单（27 个 bin，轮次 1-27）
+## 基准清单（28 个 bin，轮次 1-28）
 
 | bin | 轮次 | 主题 | 报告 |
 |---|---|---|---|
@@ -35,6 +35,7 @@
 | `handler_sub_table` | 25 | 插件事件订阅表形态（单事件 ArcSwap） | round-25 |
 | `entity_metadata_storage` | 26 | 实体元数据存储形态（扁平 Vec + 内联值） | round-26 |
 | `dispatch_guard_replay` | 27 | 事件派发逐调用分配（护栏枚举化 + 前缀精确拼接） | round-27 |
+| `shared_wasm_runtime` | 28 | Wasmtime 运行时底座共享化（Engine/Linker/线程/ticker） | round-28 |
 
 ## 运行方式
 
