@@ -500,10 +500,8 @@ pub trait ScreenHandler: Send + Sync {
     /// 更新被跟踪的槽位与属性。
     fn update_to_client(&mut self) {
         for i in 0..self.get_behaviour().slots.len() {
-            let behaviour = self.get_behaviour_mut();
-            let slot = behaviour.slots[i].clone();
-            let stack = slot.get_cloned_stack();
-            self.update_tracked_slot(i, stack);
+            let stack = self.get_behaviour_mut().slots[i].get_cloned_stack();
+            self.update_tracked_slot(i, &stack);
         }
 
         let behaviour = self.get_behaviour_mut();
@@ -555,10 +553,14 @@ pub trait ScreenHandler: Send + Sync {
     }
 
     /// 更新槽位的跟踪状态。
-    fn update_tracked_slot(&mut self, slot: usize, stack: ItemStack) {
+    ///
+    /// 按引用接收：`ItemStack` 的组件补丁是逐条目堆分配的深克隆，
+    /// 全屏扫描（46+ 槽）里绝大多数槽位未变化、只需比较——克隆
+    /// 延迟到确认变化之后。
+    fn update_tracked_slot(&mut self, slot: usize, stack: &ItemStack) {
         let behaviour = self.get_behaviour_mut();
         let other_stack = &behaviour.tracked_stacks[slot];
-        if !other_stack.are_equal(&stack) {
+        if !other_stack.are_equal(stack) {
             behaviour.tracked_stacks[slot] = stack.clone();
 
             for listener in &behaviour.listeners {
@@ -568,16 +570,16 @@ pub trait ScreenHandler: Send + Sync {
     }
 
     /// 检查某个槽位是否需要同步到客户端。
-    fn check_slot_updates(&mut self, slot: usize, stack: ItemStack) {
+    fn check_slot_updates(&mut self, slot: usize, stack: &ItemStack) {
         let behaviour = self.get_behaviour_mut();
         if !behaviour.disable_sync {
             let prev_stack = &mut behaviour.previous_tracked_stacks[slot];
 
-            if !prev_stack.is_in_sync(&stack) {
+            if !prev_stack.is_in_sync(stack) {
                 prev_stack.set_received_stack(stack.clone());
                 let next_revision = behaviour.next_revision();
                 if let Some(sync_handler) = behaviour.sync_handler.as_ref() {
-                    sync_handler.update_slot(behaviour, slot, &stack, next_revision);
+                    sync_handler.update_slot(behaviour, slot, stack, next_revision);
                 }
             }
         }
@@ -607,11 +609,10 @@ pub trait ScreenHandler: Send + Sync {
         let slots_len = self.get_behaviour().slots.len();
 
         for i in 0..slots_len {
-            let slot = self.get_behaviour().slots[i].clone();
-            let stack = slot.get_cloned_stack();
+            let stack = self.get_behaviour().slots[i].get_cloned_stack();
 
-            self.update_tracked_slot(i, stack.clone());
-            self.check_slot_updates(i, stack);
+            self.update_tracked_slot(i, &stack);
+            self.check_slot_updates(i, &stack);
         }
 
         self.check_cursor_stack_updates();
@@ -1447,5 +1448,116 @@ impl ScreenHandlerBehaviour {
     pub fn next_revision(&self) -> u32 {
         self.revision.fetch_add(1, Ordering::Relaxed);
         self.revision.fetch_and(32767, Ordering::Relaxed) & 32767
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::inventory::SimpleInventory;
+    use crate::slot::NormalSlot;
+    use papokin_data::item::Item;
+    use std::sync::atomic::AtomicUsize;
+
+    /// 只驱动槽位同步行为的最小屏幕处理器（无快速移动语义）。
+    struct SyncOnlyHandler {
+        behaviour: ScreenHandlerBehaviour,
+    }
+
+    impl ScreenHandler for SyncOnlyHandler {
+        fn get_behaviour(&self) -> &ScreenHandlerBehaviour {
+            &self.behaviour
+        }
+
+        fn get_behaviour_mut(&mut self) -> &mut ScreenHandlerBehaviour {
+            &mut self.behaviour
+        }
+
+        fn quick_move(&mut self, _player: &dyn InventoryPlayer, _slot_index: i32) -> ItemStack {
+            ItemStack::EMPTY.clone()
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+    }
+
+    /// 槽位更新计数监听器。
+    struct CountingListener {
+        updates: AtomicUsize,
+    }
+
+    impl ScreenHandlerListener for CountingListener {
+        fn on_slot_update(
+            &self,
+            _screen_handler: &ScreenHandlerBehaviour,
+            _slot: u8,
+            _stack: ItemStack,
+        ) {
+            self.updates.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn handler_with_listener() -> (SyncOnlyHandler, Arc<SimpleInventory>, Arc<CountingListener>) {
+        let inventory = Arc::new(SimpleInventory::new(3));
+        let listener = Arc::new(CountingListener {
+            updates: AtomicUsize::new(0),
+        });
+        let mut handler = SyncOnlyHandler {
+            behaviour: ScreenHandlerBehaviour::new(0, None),
+        };
+        for i in 0..3 {
+            handler.add_slot(Arc::new(NormalSlot::new(inventory.clone(), i)));
+        }
+        handler.get_behaviour_mut().listeners.push(listener.clone());
+        (handler, inventory, listener)
+    }
+
+    /// 引用化改造（槽位方法收 `&ItemStack`、克隆延迟到确认变化后）
+    /// 的行为不变式：未变化槽位在重复全屏扫描中零重发；变化槽位
+    /// 恰好重发一次且跟踪表反映新值。
+    #[test]
+    fn rescan_skips_unchanged_slots_and_syncs_changed_slot() {
+        let (mut handler, inventory, listener) = handler_with_listener();
+        inventory.set_stack(0, ItemStack::new(1, &Item::STONE));
+        inventory.set_stack(2, ItemStack::new(5, &Item::DIRT));
+
+        // 初次扫描：非空且与 EMPTY 跟踪态不同的槽 0/2 触发更新，
+        // 空槽 1 与 EMPTY 相等不触发。
+        handler.send_content_updates();
+        assert_eq!(listener.updates.load(Ordering::Relaxed), 2);
+        assert_eq!(handler.get_behaviour().tracked_stacks[2].item_count, 5);
+
+        // 稳态重复扫描（零变化）：不产生任何新的监听器调用。
+        handler.send_content_updates();
+        handler.send_content_updates();
+        assert_eq!(
+            listener.updates.load(Ordering::Relaxed),
+            2,
+            "未变化槽位不得重复触发监听器"
+        );
+
+        // 仅槽 2 变化：下一次扫描恰好只重发该槽，跟踪表更新。
+        inventory.set_stack(2, ItemStack::new(7, &Item::DIRT));
+        handler.send_content_updates();
+        assert_eq!(listener.updates.load(Ordering::Relaxed), 3);
+        assert_eq!(handler.get_behaviour().tracked_stacks[2].item_count, 7);
+        assert_eq!(
+            handler.get_behaviour().previous_tracked_stacks[2]
+                .received_stack
+                .as_ref()
+                .map_or(0, |stack| u32::from(stack.item_count)),
+            7,
+            "同步跟踪态应记录最新物品堆"
+        );
+
+        // 槽 0 清空：空与 STONE 跟踪态不同，触发一次更新。
+        inventory.set_stack(0, ItemStack::EMPTY.clone());
+        handler.send_content_updates();
+        assert_eq!(listener.updates.load(Ordering::Relaxed), 4);
     }
 }
